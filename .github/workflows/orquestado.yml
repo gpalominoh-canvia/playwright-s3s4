@@ -1,0 +1,128 @@
+name: CI orquestado
+
+# 1 · Cuándo corre (lo mismo que el ci.yml de la sesión anterior)
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  schedule:
+    - cron: '0 11 * * 1-5' # lunes a viernes, 06:00 de Lima (11:00 UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: orquestado-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # 2 · Descubrir las features: cada .feature será un job en paralelo
+  descubrir:
+    name: Descubrir features
+    runs-on: ubuntu-latest
+    outputs:
+      features: ${{ steps.lista.outputs.features }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Listar features
+        id: lista
+        run: |
+          FEATURES=$(ls features/*.feature | xargs -n1 basename | sed 's/[.]feature$//' | jq -R . | jq -sc .)
+          echo "features=$FEATURES" >> "$GITHUB_OUTPUT"
+          echo "### Features encontradas: $FEATURES" >> "$GITHUB_STEP_SUMMARY"
+
+  # 3 · Revisar tipos, en paralelo con descubrir
+  tipos:
+    name: Revisar tipos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+  # 4 · Un job por feature, todos a la vez, cuando descubrir y tipos terminaron bien
+  e2e:
+    name: E2E · ${{ matrix.feature }}
+    needs: [descubrir, tipos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false              # si una feature falla, las demás terminan igual
+      matrix:
+        feature: ${{ fromJSON(needs.descubrir.outputs.features) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Ejecutar ${{ matrix.feature }}.feature
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: npm test -- "features/$FEATURE.feature"
+      - name: Subir reporte, capturas y trazas
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-${{ matrix.feature }}
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 7
+    # 5 · Un solo resumen con todas las features (también si alguna falló)
+  reporte:
+    name: Reporte consolidado
+    needs: e2e
+    if: ${{ !cancelled() && needs.e2e.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7       # trae scripts/resumen-junit.mjs
+      - name: Descargar los reportes de cada feature
+        uses: actions/download-artifact@v8
+        with:
+          pattern: reporte-*
+          path: reportes
+      - name: Resumen por feature
+        run: |
+          for xml in reportes/reporte-*/cucumber-report.xml; do
+            feature=$(basename "$(dirname "$xml")"); feature=${feature#reporte-}
+            echo "## $feature" >> "$GITHUB_STEP_SUMMARY"
+            node scripts/resumen-junit.mjs "$xml"
+          done
+      - name: Armar el sitio con un reporte por feature
+        run: |
+          mkdir -p sitio
+          echo '<h1>E2E por feature</h1><ul>' > sitio/index.html
+          for dir in reportes/reporte-*/; do
+            feature=$(basename "$dir"); feature=${feature#reporte-}
+            cp "$dir/cucumber-report.html" "sitio/$feature.html"
+            echo "<li><a href=\"$feature.html\">$feature</a></li>" >> sitio/index.html
+          done
+          echo '</ul>' >> sitio/index.html
+      - name: Subir el sitio para Pages
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/develop'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: sitio/
+
+  # 6 · Publicar en GitHub Pages (solo desde develop)
+  publicar:
+    name: Publicar en GitHub Pages
+    needs: reporte
+    if: ${{ !cancelled() && needs.reporte.result == 'success' && github.event_name != 'pull_request' && github.ref == 'refs/heads/develop' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.despliegue.outputs.page_url }}
+    steps:
+      - id: despliegue
+        uses: actions/deploy-pages@v5
+

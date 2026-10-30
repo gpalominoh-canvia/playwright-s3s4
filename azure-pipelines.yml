@@ -1,0 +1,70 @@
+# Azure DevOps: el mismo pipeline orquestado (descubrir + tipos → un job por feature)
+
+# 1 · Cuándo corre
+trigger:
+  branches:
+    include: [main, develop]
+pr:
+  branches:
+    include: [main, develop]
+schedules:
+  - cron: '0 11 * * 1-5'            # lunes a viernes, 06:00 de Lima (11:00 UTC)
+    displayName: E2E diario
+    branches:
+      include: [develop]
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  # 2 · Descubrir las features: arma la matriz {"login": {"FEATURE": "login"}, ...}
+  - job: descubrir
+    displayName: Descubrir features
+    steps:
+      - bash: |
+          MATRIZ=$(ls features/*.feature | xargs -n1 basename | sed 's/[.]feature$//' | jq -R '{(.): {FEATURE: .}}' | jq -sc add)
+          echo "Features: $MATRIZ"
+          echo "##vso[task.setvariable variable=matriz;isOutput=true]$MATRIZ"
+        name: lista
+        displayName: Listar features
+
+  # 3 · Revisar tipos, en paralelo con descubrir
+  - job: tipos
+    displayName: Revisar tipos
+    steps:
+      - task: UseNode@1
+        inputs:
+          version: '24.x'
+      - script: npm ci
+      - script: npm run typecheck
+
+  # 4 · Un job por feature, cuando descubrir y tipos terminaron bien
+  - job: e2e
+    displayName: E2E
+    dependsOn: [descubrir, tipos]   # = needs: [descubrir, tipos]
+    timeoutInMinutes: 15
+    strategy:
+      matrix: $[ dependencies.descubrir.outputs['lista.matriz'] ]
+    steps:
+      - task: UseNode@1
+        inputs:
+          version: '24.x'
+      - script: npm ci
+      - script: npx playwright install --with-deps chromium
+      - bash: npm test -- "features/$FEATURE.feature"
+        displayName: Ejecutar la feature
+      # 5 · Reporte: Azure junta los resultados de todos los jobs en la pestaña Tests
+      - task: PublishTestResults@2
+        displayName: Publicar resultados
+        condition: succeededOrFailed()   # = if: !cancelled()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: reports/cucumber-report.xml
+          testRunTitle: E2E $(FEATURE)
+      - task: PublishPipelineArtifact@1
+        displayName: Guardar reporte, capturas y trazas
+        condition: succeededOrFailed()
+        inputs:
+          targetPath: reports
+          artifact: reporte-$(FEATURE)-intento$(System.JobAttempt)
